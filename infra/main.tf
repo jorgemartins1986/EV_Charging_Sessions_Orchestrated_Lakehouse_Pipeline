@@ -34,7 +34,7 @@ resource "aws_s3_bucket_public_access_block" "lake" {
 
 locals {
     lake_prefixes = [
-        "bronze/raw/ev_sessions/",
+        "bronze/raw/",
         "bronze/quarantine/ev_sessions_bad/",
         "silver/ev_sessions_clean/",
         "gold/ev_sessions/",
@@ -54,7 +54,7 @@ resource "aws_s3_object" "lake_prefixes" {
 # ADD THE DATASET (CSV FILE) TO THE S3 BUCKET
 # --------------------------------------------------------------
 
-resource "aws_s3_bucket_object" "input_data" {
+resource "aws_s3_object" "input_data" {
     bucket       = aws_s3_bucket.lake.id
     key          = "bronze/raw/station_data_dataverse.csv"
     source       = abspath("${path.module}/../data-samples/station_data_dataverse.csv")
@@ -78,6 +78,7 @@ resource "aws_glue_crawler" "ev_sessions_raw" {
     name          = var.glue_crawler_name
     role          = aws_iam_role.glue_crawler_role.arn
     database_name = aws_glue_catalog_database.bronze.name
+    table_prefix  = "ev_sessions_"
 
     s3_target {
         path = "s3://${aws_s3_bucket.lake.bucket}/bronze/raw/"

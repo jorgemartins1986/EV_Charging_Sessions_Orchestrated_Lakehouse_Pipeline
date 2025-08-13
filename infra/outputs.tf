@@ -13,12 +13,12 @@ output "lake_bucket_arn" {
 
 output "raw_prefix_uri" {
     description = "S3 URI to the raw EV sessions prefix"
-    value       = "s3://${aws_s3_bucket.lake.bucket}/bronze/raw/ev_sessions/"
+    value       = "s3://${aws_s3_bucket.lake.bucket}/bronze/raw/"
 }
 
 output "dataset_object_uri" {
     description = "S3 URI of the uploaded sample CSV"
-    value       = "s3://${aws_s3_bucket.lake.bucket}/${aws_s3_bucket_object.input_data.key}"
+    value       = "s3://${aws_s3_bucket.lake.bucket}/${aws_s3_object.input_data.key}"
 }
 
 output "athena_results_uri" {
