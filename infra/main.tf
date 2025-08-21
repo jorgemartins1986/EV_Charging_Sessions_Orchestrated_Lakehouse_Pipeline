@@ -51,6 +51,30 @@ resource "aws_s3_object" "lake_prefixes" {
 }
 
 # --------------------------------------------------------------
+# Upload PyDeequ ZIP (if you want to use --extra-py-files)
+# --------------------------------------------------------------
+
+resource "aws_s3_object" "pydeequ_zip" {
+  bucket       = aws_s3_bucket.lake.id
+  key          = "dependencies/pydeequ.zip"
+  source       = abspath("${path.module}/../dependencies/pydeequ.zip")
+  etag         = filemd5("${path.module}/../dependencies/pydeequ.zip")
+  content_type = "application/zip"
+}
+
+# --------------------------------------------------------------
+# Upload Deequ JAR for Spark (Glue) – pick version that matches Spark
+# --------------------------------------------------------------
+
+resource "aws_s3_object" "deequ_jar" {
+  bucket       = aws_s3_bucket.lake.id
+  key          = "dependencies/deequ-2.0.10-spark-3.5.jar"
+  source       = abspath("${path.module}/../dependencies/deequ-2.0.10-spark-3.5.jar")
+  etag         = filemd5("${path.module}/../dependencies/deequ-2.0.10-spark-3.5.jar")
+  content_type = "application/java-archive"
+}
+
+# --------------------------------------------------------------
 # ADD THE DATASET (CSV FILE) TO THE S3 BUCKET
 # --------------------------------------------------------------
 
