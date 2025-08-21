@@ -291,6 +291,83 @@ resource "aws_iam_policy" "athena_query_policy" {
 }
 
 # --------------------------------------------------------------
+# IAM ROLE FOR GLUE ETL SILVER JOB
+# --------------------------------------------------------------
+resource "aws_iam_role" "glue_etl_silver" {
+  name = "glue-etl-silver-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "glue.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+# --------------------------------------------------------------
+# ATTACH INLINE POLICY TO GLUE ROLE
+# --------------------------------------------------------------
+resource "aws_iam_role_policy" "glue_silver_policy" {
+  name = "glue-etl-silver-policy"
+  role = aws_iam_role.glue_etl_silver.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "S3LakeAccess"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = "arn:aws:s3:::${aws_s3_bucket.lake.id}"
+      },
+      {
+        Sid      = "S3LakeObjects"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject","s3:PutObject","s3:DeleteObject"]
+        Resource = "arn:aws:s3:::${aws_s3_bucket.lake.id}/*"
+      },
+      {
+        Sid      = "Logs"
+        Effect   = "Allow"
+        Action   = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "GlueCatalog",
+        Effect = "Allow",
+        Action = [
+            "glue:CreateDatabase",
+            "glue:GetDatabase",
+            "glue:GetDatabases",
+            "glue:CreateTable",
+            "glue:UpdateTable",
+            "glue:GetTable",
+            "glue:GetTables",
+
+            # Partitions (needed for MSCK REPAIR and partition ops)
+            "glue:CreatePartition",
+            "glue:BatchCreatePartition",
+            "glue:GetPartition",
+            "glue:GetPartitions",
+            "glue:BatchGetPartition",
+            "glue:UpdatePartition",
+            "glue:DeletePartition"
+        ],
+        Resource = "*"
+        }
+    ]
+  })
+}
+
+# --------------------------------------------------------------
 # Attach to an existing IAM USER
 # --------------------------------------------------------------
 
