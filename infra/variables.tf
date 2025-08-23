@@ -22,7 +22,7 @@ variable "environment" {
     type        = string
 }
 
-variable "glue_database_name" {
+variable "glue_bronze_database_name" {
     description = "Glue database name for raw bronze tables"
     type        = string
 }
@@ -41,4 +41,14 @@ variable "athena_user_name" {
     description = "Existing IAM user to attach Athena policy to (leave null to skip attachment)"
     type        = string
     default     = null
+}
+
+variable "glue_silver_database_name" {
+    description = "Glue database name for silver tables"
+    type        = string
+}
+
+variable "glue_crawler_silver_name" {
+    description = "Glue crawler name for EV sessions silver data"
+    type        = string
 }

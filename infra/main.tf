@@ -89,15 +89,15 @@ resource "aws_s3_object" "input_data" {
 }
 
 # --------------------------------------------------------------
-# GLUE DATABASE
+# GLUE BRONZE DATABASE
 # --------------------------------------------------------------
 
 resource "aws_glue_catalog_database" "bronze" {
-    name = var.glue_database_name
+    name = var.glue_bronze_database_name
 }
 
 # --------------------------------------------------------------
-# GLUE CRAWLER
+# GLUE CRAWLER BRONZE RAW
 # --------------------------------------------------------------
 
 resource "aws_glue_crawler" "ev_sessions_raw" {
@@ -451,4 +451,125 @@ resource "aws_glue_job" "silver_etl_clean" {
     Layer   = "Silver"
     IaC     = "Terraform"
   }
+}
+
+# --------------------------------------------------------------
+# GLUE SILVER DATABASE
+# --------------------------------------------------------------
+
+resource "aws_glue_catalog_database" "silver" {
+  name = var.glue_silver_database_name
+}
+
+# --------------------------------------------------------------
+# IAM ROLE FOR GLUE SILVER CRAWLER
+# --------------------------------------------------------------
+
+resource "aws_iam_role" "glue_crawler_silver_role" {
+  name = "${var.glue_crawler_silver_name}-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "glue.amazonaws.com" }
+    }]
+  })
+}
+
+# --------------------------------------------------------------
+# IAM POLICY FOR GLUE SILVER CRAWLER
+# --------------------------------------------------------------
+
+resource "aws_iam_policy" "glue_crawler_silver_policy" {
+  name        = "${var.glue_crawler_silver_name}-policy"
+  description = "Policy for Glue crawler to read S3 and update Data Catalog"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      # --- S3 list on the bucket (limit to silver prefix) ---
+      {
+        Effect = "Allow"
+        Action = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.lake.arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = [
+              "silver/ev_sessions_clean/*",
+              "silver/ev_sessions_clean"
+            ]
+          }
+        }
+      },
+      # --- S3 read objects under silver prefix ---
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "${aws_s3_bucket.lake.arn}/silver/ev_sessions_clean/*"
+      },
+      # --- Glue Catalog permissions (incl. partitions) ---
+      {
+        Effect = "Allow"
+        Action = [
+          "glue:GetDatabase", "glue:GetDatabases", "glue:CreateDatabase",
+          "glue:CreateTable", "glue:GetTable", "glue:GetTables", "glue:UpdateTable", "glue:DeleteTable",
+          "glue:GetPartition", "glue:GetPartitions", "glue:CreatePartition", "glue:BatchCreatePartition",
+          "glue:UpdatePartition", "glue:BatchGetPartition", "glue:BatchUpdatePartition", "glue:DeletePartition"
+        ]
+        Resource = "*"
+      }
+      # If your bucket uses a CMK, also add kms:Decrypt for that key
+      # {
+      #   Effect = "Allow"
+      #   Action = ["kms:Decrypt"]
+      #   Resource = "<kms-key-arn>"
+      # }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "glue_crawler_silver_attach" {
+  role       = aws_iam_role.glue_crawler_silver_role.name
+  policy_arn = aws_iam_policy.glue_crawler_silver_policy.arn
+}
+
+# --------------------------------------------------------------
+# GLUE CRAWLER SILVER
+# --------------------------------------------------------------
+
+resource "aws_glue_crawler" "ev_sessions_silver" {
+  name          = var.glue_crawler_silver_name
+  role          = aws_iam_role.glue_crawler_silver_role.arn
+  database_name = aws_glue_catalog_database.silver.name
+  table_prefix  = "ev_sessions_"
+
+  s3_target {
+    path = "s3://${aws_s3_bucket.lake.bucket}/silver/ev_sessions_clean/"
+  }
+
+  # Only keep keys that belong in configuration
+  configuration = jsonencode({
+    Version = 1.0
+    CrawlerOutput = {
+      Partitions = { AddOrUpdateBehavior = "InheritFromTable" }
+    }
+    Grouping = {
+      TableGroupingPolicy = "CombineCompatibleSchemas"
+    }
+  })
+
+  # <-- Schema change policy goes here, not in configuration JSON
+  schema_change_policy {
+    update_behavior = "UPDATE_IN_DATABASE"
+    delete_behavior = "LOG" # or "DELETE_FROM_DATABASE"
+  }
+
+  recrawl_policy {
+    recrawl_behavior = "CRAWL_EVERYTHING"
+  }
+
+  # optional schedule
+  # schedule = "cron(0 2 * * ? *)"
 }
