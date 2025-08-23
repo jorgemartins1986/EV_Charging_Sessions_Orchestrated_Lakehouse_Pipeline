@@ -1,6 +1,4 @@
-# silver_etl_clean.py
-# Glue 5.0 (Spark 3.5). Validates with PyDeequ, writes silver + quarantine.
-
+import os
 import sys, argparse, json
 from datetime import datetime
 
@@ -8,13 +6,10 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import *
 
-# Try Glue context if present, but keep it runnable locally.
-try:
-    from awsglue.utils import getResolvedOptions
-    GLUE = True
-except Exception:
-    GLUE = False
-
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
 
 # Parse args
 DEFAULTS = {
@@ -28,25 +23,28 @@ DEFAULTS = {
 }
 
 def parse_args():
-    if GLUE:
-        params = [
-            "dataset","target_bucket","input_prefix","silver_prefix",
-            "quarantine_prefix","secondary_partition","fail_mode"
-        ]
-        args = getResolvedOptions(sys.argv, params)
-        return {**DEFAULTS, **args}
-    else:
-        parser = argparse.ArgumentParser()
-        for k, v in DEFAULTS.items():
-            parser.add_argument(f"--{k}", default=v)
-        return vars(parser.parse_args())
+    params = [
+        "JOB_NAME", "dataset", "target_bucket", "input_prefix", "silver_prefix",
+        "quarantine_prefix", "secondary_partition", "fail_mode"
+    ]
+    args = getResolvedOptions(sys.argv, params)
+    return {**DEFAULTS, **args}
 
 cfg = parse_args()
 
 
 # Spark session
-spark = SparkSession.builder.appName(f"silver-etl-{cfg['dataset']}").getOrCreate()
+spark = SparkSession.builder.appName(f"ev-sessions-silver-etl-{cfg['dataset']}").getOrCreate()
+glue_ctx = GlueContext(spark.sparkContext)
+job = Job(glue_ctx)
+job.init(cfg["JOB_NAME"], cfg)
 spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+spark.conf.set("spark.sql.files.ignoreEmptyFiles", "true")
+spark.conf.set("spark.sql.shuffle.partitions", "8")
+
+# Spark version fix
+spark_version = spark.version  # e.g. '3.5.0-amzn-0'
+os.environ.setdefault("SPARK_VERSION", ".".join(spark_version.split(".")[:2]))  # -> '3.5'
 
 
 # Input / Output paths
@@ -56,11 +54,13 @@ QOUT = f"s3://{cfg['target_bucket']}/{cfg['quarantine_prefix']}"
 
 
 # Read bronze (CSV)
-df = (spark.read
-      .option("header", True)
-      .option("inferSchema", True)
-      .csv(SRC))
+df = spark.read.option("header", True).option("inferSchema", True).csv(SRC + "station_data_dataverse.csv")
 
+print("Rows:", df.count())
+df.show(5)
+
+# Drop unnecessary columns
+df = df.drop("Mon", "Tues", "Wed", "Thurs", "Fri", "Sat", "Sun", "reportedZip", "startTime", "endTime")
 
 # Cast/normalize key columns as needed
 df = (df
@@ -105,7 +105,7 @@ facility_type_map = {
 facility_map_expr = F.create_map([F.lit(x) for x in sum(facility_type_map.items(), ())])
 
 df = df.withColumn("facilityType",
-                   F.when(F.col("facilityType").isin(facility_type_map.keys()),
+                   F.when(F.col("facilityType").isin(list(facility_type_map.keys())),
                           facility_map_expr[F.col("facilityType")])
                     .otherwise(F.col("facilityType")))
 
@@ -123,14 +123,17 @@ weekday_map = {
 weekday_map_expr = F.create_map([F.lit(x) for x in sum(weekday_map.items(), ())])
 
 df = df.withColumn("weekday",
-                   F.when(F.col("weekday").isin(weekday_map.keys()),
+                   F.when(F.col("weekday").isin(list(weekday_map.keys())),
                           weekday_map_expr[F.col("weekday")])
                     .otherwise(F.col("weekday")))
 
+df.show(5)
 
-# PyDeequ checks 
+# PyDeequ checks
+print("Starting PyDeequ checks...")
+
 from pydeequ.checks import Check, CheckLevel
-from pydeequ.verification import VerificationSuite
+from pydeequ.verification import VerificationSuite, VerificationResult
 
 check = (Check(spark, CheckLevel.Error, "silver_rules")
     # Completeness
@@ -154,35 +157,44 @@ vr = (VerificationSuite(spark)
       .addCheck(check)
       .run())
 
-# Optionally persist summary
-summary_path = f"s3://{cfg['target_bucket']}/quality_reports/{cfg['dataset']}/event_date={datetime.utcnow().date().isoformat()}/"
-try:
-    from pydeequ.repository import FileSystemMetricsRepository, ResultKey
-    repo = FileSystemMetricsRepository(spark, summary_path)
-    key = ResultKey(spark, resultKey=cfg["dataset"])
-    repo.save(vr, key)
-except Exception:
-    pass  # non-fatal if repository not configured
+# fail the job when checks fail
+if cfg["fail_mode"] == "fail_job" and str(vr.status) != "Success":
+    print(f"Data quality FAILED: {vr.status}")
+    job.commit()      # ensure cleanup logs; Glue still marks as Failed because of the raised error
+    raise RuntimeError("PyDeequ checks failed")
+
+print("All checks passed!")
 
 
 # Row-level quarantine reasons
-reasons = [
-    F.when(F.col("sessionId").isNull(), F.lit("sessionId_null")),
-    F.when(F.col("userId").isNull(), F.lit("userId_null")),
-    F.when(F.col("stationId").isNull(), F.lit("stationId_null")),
-    F.when(F.col("locationId").isNull(), F.lit("locationId_null")),
-    F.when((F.col("kwhTotal").isNull()) | (F.col("kwhTotal") <= 0), F.lit("kwhTotal_non_positive")),
-    F.when((F.col("dollars").isNull()) | (F.col("dollars") < 0), F.lit("dollars_negative")),
-    F.when((F.col("distance").isNull()) | (F.col("distance") < 0), F.lit("distance_negative")),
-    F.when((F.col("chargeTimeHrs").isNull()) | (F.col("chargeTimeHrs") <= 0), F.lit("duration_invalid")),
-    F.when(~F.col("facilityType").isin("Manufacturing","Office","Research and Development","Other"), F.lit("facilityType_invalid")),
-    # Time order checks
-    F.when(F.col("created").isNull() | F.col("ended").isNull(), F.lit("timestamp_null")),
-    F.when(F.col("ended") <= F.col("created"), F.lit("end_before_start"))
+rules = [
+    F.when(F.col("sessionId").isNull(), F.lit("sessionId_null")).otherwise(F.lit(None)),
+    F.when(F.col("userId").isNull(), F.lit("userId_null")).otherwise(F.lit(None)),
+    F.when(F.col("stationId").isNull(), F.lit("stationId_null")).otherwise(F.lit(None)),
+    F.when(F.col("locationId").isNull(), F.lit("locationId_null")).otherwise(F.lit(None)),
+    F.when(F.col("kwhTotal").isNull() | (F.col("kwhTotal") <= 0), F.lit("kwhTotal_non_positive")).otherwise(F.lit(None)),
+    F.when(F.col("dollars").isNull() | (F.col("dollars") < 0), F.lit("dollars_negative")).otherwise(F.lit(None)),
+    F.when(F.col("distance").isNull() | (F.col("distance") < 0), F.lit("distance_negative_or_zero")).otherwise(F.lit(None)),
+    F.when(F.col("chargeTimeHrs").isNull() | (F.col("chargeTimeHrs") <= 0), F.lit("duration_invalid")).otherwise(F.lit(None)),
+    F.when(~F.col("facilityType").isin("Manufacturing","Office","Research and Development","Other"),
+           F.lit("facilityType_invalid")).otherwise(F.lit(None)),
+    F.when(F.col("created").isNull() | F.col("ended").isNull(), F.lit("timestamp_null")).otherwise(F.lit(None)),
+    F.when(F.col("created").isNotNull() & F.col("ended").isNotNull() & (F.col("ended") <= F.col("created")),
+           F.lit("end_before_start")).otherwise(F.lit(None)),
 ]
 
-df = df.withColumn("quarantine_reason", F.array_remove(F.array([F.coalesce(x, F.lit(None)) for x in reasons]), None))
+# Build array, drop nulls, and (optionally) convert [] -> null
+df = (
+    df.withColumn("_reasons", F.array(*rules))
+      .withColumn("quarantine_reason", F.expr("filter(_reasons, x -> x is not null)"))
+      .drop("_reasons")
+)
 
+# # If you prefer NULL instead of [] when no reasons:
+# df = df.withColumn(
+#     "quarantine_reason",
+#     F.when(F.size("quarantine_reason") == 0, F.lit(None)).otherwise(F.col("quarantine_reason"))
+# )
 
 # Split & write
 secondary = cfg["secondary_partition"]
@@ -195,15 +207,19 @@ bad  = df.filter(F.size("quarantine_reason") > 0)
 good_count = good.count()
 bad_count  = bad.count()
 
+good.show(5)
+bad.show(5)
+print(f"Good rows: {good_count}, Bad rows: {bad_count}")
+
 # Write to parquet
 (good.write
- .mode("append")
+ .mode("overwrite")
  .option("compression", "zstd")
  .partitionBy(*partition_cols)
  .parquet(OUT))
 
 (bad.write
- .mode("append")
+ .mode("overwrite")
  .option("compression", "zstd")
  .partitionBy(*partition_cols)
  .parquet(QOUT))
@@ -215,34 +231,39 @@ if bad_count > 0 and cfg["fail_mode"].lower() == "fail_job":
 print(f"ETL complete. Partitions={partition_cols}. Good={good_count}, Quarantined={bad_count}")
 
 
-# Create database and table
-db = "ev_sessions_silver"
-table = "ev_sessions_clean"
-spark.sql(f"CREATE DATABASE IF NOT EXISTS `{db}`")
+# # Create database and table
+# db = "ev_sessions_silver"
+# table = "ev_sessions_clean"
+# spark.sql(f"CREATE DATABASE IF NOT EXISTS `{db}`")
 
-# Create an empty external table pointing to the location (let schema be inferred by crawler or define it explicitly)
-spark.sql(f"""
-  CREATE EXTERNAL TABLE IF NOT EXISTS `{db}`.`{table}` (
-    sessionId STRING,
-    userId STRING,
-    stationId STRING,
-    locationId STRING,
-    kwhTotal DOUBLE,
-    dollars DOUBLE,
-    distance DOUBLE,
-    chargeTimeHrs DOUBLE,
-    facilityType STRING,
-    platform STRING,
-    weekday STRING,
-    created TIMESTAMP,
-    ended TIMESTAMP
-  )
-  PARTITIONED BY (event_date DATE, stationId STRING)
-  STORED AS PARQUET
-  LOCATION '{OUT}'
-""")
+# # Create an empty external table pointing to the location (let schema be inferred by crawler or define it explicitly)
+# spark.sql(f"""
+#   CREATE EXTERNAL TABLE IF NOT EXISTS `{db}`.`{table}` (
+#     sessionId STRING,
+#     userId STRING,
+#     stationId STRING,
+#     locationId STRING,
+#     kwhTotal DOUBLE,
+#     dollars DOUBLE,
+#     distance DOUBLE,
+#     chargeTimeHrs DOUBLE,
+#     facilityType STRING,
+#     platform STRING,
+#     weekday STRING,
+#     created TIMESTAMP,
+#     ended TIMESTAMP
+#   )
+#   PARTITIONED BY (event_date DATE, stationId STRING)
+#   STORED AS PARQUET
+#   LOCATION '{OUT}'
+# """)
 
-# Make partitions visible (needed when you wrote files directly)
-spark.sql(f"MSCK REPAIR TABLE `{db}`.`{table}`")
-print("Registered existing silver data in Glue Catalog.")
+# # Make partitions visible (needed when you wrote files directly)
+# spark.sql(f"MSCK REPAIR TABLE `{db}`.`{table}`")
+# print("Registered existing silver data in Glue Catalog.")
 
+# this ends the Glue run cleanly
+spark.catalog.clearCache()
+job.commit()
+spark.sparkContext._gateway.shutdown_callback_server()
+spark.stop()

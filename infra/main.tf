@@ -38,7 +38,9 @@ locals {
         "bronze/quarantine/ev_sessions_bad/",
         "silver/ev_sessions_clean/",
         "gold/ev_sessions/",
-        "athena/results/"
+        "athena/results/",
+        "jobs/",
+        "tmp/glue/"
     ]
 }
 
@@ -312,59 +314,67 @@ resource "aws_iam_role" "glue_etl_silver" {
 # ATTACH INLINE POLICY TO GLUE ROLE
 # --------------------------------------------------------------
 resource "aws_iam_role_policy" "glue_silver_policy" {
-  name = "glue-etl-silver-policy"
-  role = aws_iam_role.glue_etl_silver.id
+    name = "glue-etl-silver-policy"
+    role = aws_iam_role.glue_etl_silver.id
 
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid      = "S3LakeAccess"
-        Effect   = "Allow"
-        Action   = ["s3:ListBucket"]
-        Resource = "arn:aws:s3:::${aws_s3_bucket.lake.id}"
-      },
-      {
-        Sid      = "S3LakeObjects"
-        Effect   = "Allow"
-        Action   = ["s3:GetObject","s3:PutObject","s3:DeleteObject"]
-        Resource = "arn:aws:s3:::${aws_s3_bucket.lake.id}/*"
-      },
-      {
-        Sid      = "Logs"
-        Effect   = "Allow"
-        Action   = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
+    policy = jsonencode({
+        Version = "2012-10-17"
+        Statement = [
+            {
+                Sid      = "S3LakeAccess"
+                Effect   = "Allow"
+                Action   = ["s3:ListBucket"]
+                Resource = "arn:aws:s3:::${aws_s3_bucket.lake.id}"
+            },
+            {
+                Sid      = "S3LakeObjects"
+                Effect   = "Allow"
+                Action   = ["s3:GetObject","s3:PutObject","s3:DeleteObject"]
+                Resource = "arn:aws:s3:::${aws_s3_bucket.lake.id}/*"
+            },
+            {
+                Sid      = "Logs"
+                Effect   = "Allow"
+                Action   = [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                ]
+                Resource = "*"
+            },
+            {
+                Sid    = "CloudWatchMetrics",
+                Effect = "Allow",
+                Action = [
+                    "cloudwatch:PutMetricData"
+                ],
+                Resource = "*"
+            },
+            {
+                Sid    = "GlueCatalog",
+                Effect = "Allow",
+                Action = [
+                        "glue:CreateDatabase",
+                        "glue:GetDatabase",
+                        "glue:GetDatabases",
+                        "glue:CreateTable",
+                        "glue:UpdateTable",
+                        "glue:GetTable",
+                        "glue:GetTables",
+
+                        # Partitions (needed for MSCK REPAIR and partition ops)
+                        "glue:CreatePartition",
+                        "glue:BatchCreatePartition",
+                        "glue:GetPartition",
+                        "glue:GetPartitions",
+                        "glue:BatchGetPartition",
+                        "glue:UpdatePartition",
+                        "glue:DeletePartition"
+                ],
+                Resource = "*"
+                }
         ]
-        Resource = "*"
-      },
-      {
-        Sid    = "GlueCatalog",
-        Effect = "Allow",
-        Action = [
-            "glue:CreateDatabase",
-            "glue:GetDatabase",
-            "glue:GetDatabases",
-            "glue:CreateTable",
-            "glue:UpdateTable",
-            "glue:GetTable",
-            "glue:GetTables",
-
-            # Partitions (needed for MSCK REPAIR and partition ops)
-            "glue:CreatePartition",
-            "glue:BatchCreatePartition",
-            "glue:GetPartition",
-            "glue:GetPartitions",
-            "glue:BatchGetPartition",
-            "glue:UpdatePartition",
-            "glue:DeletePartition"
-        ],
-        Resource = "*"
-        }
-    ]
-  })
+    })
 }
 
 # --------------------------------------------------------------
@@ -375,4 +385,70 @@ resource "aws_iam_user_policy_attachment" "attach_athena_policy_to_user" {
     count      = var.athena_user_name == null ? 0 : 1
     user       = var.athena_user_name
     policy_arn = aws_iam_policy.athena_query_policy.arn
+}
+
+# --------------------------------------------------------------
+# Upload Glue job script
+# --------------------------------------------------------------
+resource "aws_s3_object" "glue_script_silver_clean" {
+  bucket       = aws_s3_bucket.lake.id
+  key          = "jobs/ev_sessions_silver_etl_clean.py"   # must match aws_glue_job.command.script_location
+  source       = abspath("${path.module}/../jobs/ev_sessions_silver_etl_clean.py")
+  etag         = filemd5("${path.module}/../jobs/ev_sessions_silver_etl_clean.py")
+  content_type = "text/x-python"
+}
+
+# --------------------------------------------------------------
+# GLUE JOB: silver-etl-clean
+# --------------------------------------------------------------
+resource "aws_glue_job" "silver_etl_clean" {
+  name     = "ev-sessions-silver-etl-clean"
+  role_arn = aws_iam_role.glue_etl_silver.arn
+  depends_on = [aws_s3_object.glue_script_silver_clean]
+
+  command {
+    name            = "glueetl"
+    python_version  = "3"
+    script_location = "s3://${aws_s3_bucket.lake.bucket}/jobs/ev_sessions_silver_etl_clean.py"
+  }
+
+  glue_version      = "5.0"
+  worker_type       = "G.1X"
+  number_of_workers = 2
+  timeout           = 30        # minutes
+  max_retries       = 1
+
+  default_arguments = {
+    "--dataset"             = "station"
+    "--target_bucket"       = aws_s3_bucket.lake.bucket
+    "--input_prefix"        = "bronze/raw/"
+    "--silver_prefix"       = "silver/ev_sessions_clean/"
+    "--quarantine_prefix"   = "bronze/quarantine/ev_sessions_bad/"
+    "--secondary_partition" = "stationId"
+    "--fail_mode"           = "quarantine"
+
+    # Spark version fix
+    "--SPARK_VERSION"       = "3.5"
+
+    # Dependencies
+    "--extra-py-files"      = "s3://${aws_s3_bucket.lake.bucket}/dependencies/pydeequ.zip"
+    "--extra-jars"          = "s3://${aws_s3_bucket.lake.bucket}/dependencies/deequ-2.0.10-spark-3.5.jar"
+
+    # Nice-to-haves
+    "--enable-metrics"      = "true"
+    "--job-language"        = "python"
+    "--TempDir"             = "s3://${aws_s3_bucket.lake.bucket}/tmp/glue/"
+  }
+
+  # Concurrency guard
+  execution_property {
+    max_concurrent_runs = 1
+  }
+
+  # Tags help when showcasing
+  tags = {
+    Project = "EV-Sessions"
+    Layer   = "Silver"
+    IaC     = "Terraform"
+  }
 }
