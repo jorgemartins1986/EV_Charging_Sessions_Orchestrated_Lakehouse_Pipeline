@@ -543,7 +543,7 @@ resource "aws_glue_crawler" "ev_sessions_silver" {
   name          = var.glue_crawler_silver_name
   role          = aws_iam_role.glue_crawler_silver_role.arn
   database_name = aws_glue_catalog_database.silver.name
-  table_prefix  = "ev_sessions_"
+  # table_prefix  = "ev_sessions_"
 
   s3_target {
     path = "s3://${aws_s3_bucket.lake.bucket}/silver/ev_sessions_clean/"
